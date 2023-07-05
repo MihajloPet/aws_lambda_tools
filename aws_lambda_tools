@@ -1,0 +1,182 @@
+from simple_salesforce import Salesforce
+import json
+import boto3
+from botocore.exceptions import ClientError
+import pandas as pd
+
+# from save_to_s3 import csv_to_s3
+
+from sqlalchemy import create_engine
+from sqlalchemy import text
+
+from datetime import datetime
+from save_to_s3 import csv_to_s3
+
+# Function to extract record type from RecordType.Name OrderedDict
+def get_record_type(ob_dict):
+    record_type=''
+    try:
+        record_type = ob_dict['Name']
+    except:
+        pass
+    return record_type
+
+def df_to_csv_on_s3(df, s3_bucket_name, s3_subfolder, file_name, add_timestamp=True):
+
+    # check if timestamp is needed
+    if add_timestamp==True:
+        file_name = file_name + ' - ' + datetime.now().strftime("%Y-%m-%d %H-%M")
+    elif add_timestamp==False:
+        file_name = file_name
+    else:
+        raise ValueError("Parameter must be either True or False.")
+
+    # save Targets file as csv on S3
+    csv_to_s3(df = df,bucket_name = s3_bucket_name, subfolder=s3_subfolder, file_name = file_name)
+    print(f'File saved as {file_name}.')
+
+#extract secret from AWS Secrets Manager
+def get_secret(secrets_name, region_name):
+    # Create a Secrets Manager client
+    session = boto3.session.Session()
+    client = session.client(
+        service_name='secretsmanager',
+        region_name=region_name
+    )
+    try:
+        get_secret_value_response = client.get_secret_value(
+            SecretId=secrets_name
+        )
+    except ClientError as e:
+        # For a list of exceptions thrown, see
+        # https://docs.aws.amazon.com/secretsmanager/latest/apireference/API_GetSecretValue.html
+        raise e
+    
+    
+    SFDC_secrets = json.loads(get_secret_value_response['SecretString'])
+    
+    # depending on secret names is goin to query, the first one is for "SFDC_integrations" secret, the second one is for  
+    try:
+        user=SFDC_secrets['SFusername']
+        pas=SFDC_secrets['SFpassword']
+        sec=SFDC_secrets['SFsecurity_token']
+    except:
+        user=SFDC_secrets['username']
+        pas=SFDC_secrets['password']
+        sec = ''
+    
+    return (user, pas, sec)
+    
+
+
+###########################
+class SFDC(Salesforce):
+    # Define the class constructor method and initialize the necessary attributes
+    def __init__(self, username, password, security_token): 
+        # Call the constructor of the base class (Salesforce) to initialize its attributes - this is actually loading to SFDC
+        super().__init__(username=username, password=password, security_token=security_token)
+        
+
+    def query_salesforce_to_df(self, query_string):
+        # Function which makes a connection to Salesforce using credentials, sending a query and transforming the output into a dataframe
+        # Query object
+        query_output = self.query(query_string)
+
+        # Extract records
+        query_output_records = query_output.get('records')
+
+        # Transform to a dataframe
+        df = pd.DataFrame(query_output_records)
+
+        return df
+    
+        
+        
+    def object_elements(self, object_name=''):
+        #function which returns will take object name as input and return dataframe containing field labels, field name and object data type
+        #if no object name is entered, function will return dataframe containing object labels, object name and indicator if field is custom made
+    
+        if object_name!='':
+            desc = getattr(self,object_name).describe()
+
+            #this is going to get us fieald label & aneme, data type and lenght of each field, which can be used for automation of db setup
+            fields = pd.DataFrame(desc['fields'])[['label','name','soapType','byteLength']]
+            fields['soapType'] = fields['soapType'].str.split(':').apply(lambda x: x[1])
+        else:
+            desc = self.describe()
+            fields = pd.DataFrame(desc['sobjects'])[['label','name','custom']]
+            
+        return fields
+ ############################
+
+
+# Define the Rds class
+class Rds():
+    def __init__(self, db_name, db_endpoint, username, password):
+        self.db_name = db_name
+        self.db_endpoint = db_endpoint
+        self.username = username
+        self.password = password
+        self.engine = None
+
+        self.log_in_rds()
+
+    def log_in_rds(self):
+        database_uri = f"postgresql://{self.username}:{self.password}@{self.db_endpoint}/{self.db_name}"
+        self.engine = create_engine(database_uri).connect()
+
+    def read_base(self, query_string):
+        df = pd.read_sql_query(text(query_string), con=self.engine)
+        return df
+
+    #Create load to rds function which is loading dataframe to rds
+    def load_df_to_rds_postgres(self, df, table_name, schema_name, replace_or_append = 'append'):
+        df.to_sql(table_name,schema=schema_name,con=self.engine,index=False,if_exists=replace_or_append) 
+
+#CODE EXAMPLES:
+
+# import aws_lambda_tools
+
+# Read credentials
+# cred = aws_lambda_tools.get_secret(secrets_name="", region_name="")
+
+
+#TEST Rds class
+#create engine
+# engine = aws_lambda_tools.Rds(db_name='',db_endpoint='',username=cred[0], password=cred[1])
+
+# #read postgres table
+# df_test = engine.read_base('SELECT id FROM survey_responses LIMIT 100')
+# print(df_test)
+
+# #load to postgres table
+# df_test = pd.DataFrame({'col_name':[1,2,3]})
+# engine.load_df_to_rds_postgres(df_test, table_name='test', schema_name='')
+
+
+
+#####################
+# #SFDC Example
+# cred = aws_lambda_tools.get_secret(secrets_name="", region_name="")
+
+# # Create an instance of the SFDC class
+# sf = aws_lambda_tools.SFDC(username= cred[0], password=cred[1], security_token=cred[2])
+
+# # Define your query string
+# query_string = """
+#                     """
+
+# # # Call the query_salesforce_to_df method
+# # result_df = sf.query_salesforce_to_df(query_string)
+
+# # #call object elements method
+# # result_df = sf.object_elements('Account')
+
+# # call object_elements
+# result_df = sf.query_salesforce_to_df(query_string)
+# result_df['Record Type']=result_df['RecordType'].apply(lambda x: aws_lambda_tools.get_record_type(x))
+
+# # Print the resulting DataFrame
+# print(result_df)
+
+
